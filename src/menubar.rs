@@ -97,13 +97,14 @@ fn read_state_from_file(path: &PathBuf) -> VoxtypeState {
         .unwrap_or(VoxtypeState::Stopped)
 }
 
-/// Get the voxtype binary path
+/// Get the voxtype binary path.
+///
+/// The menubar is the same multicall binary as the CLI/daemon, so prefer
+/// our own executable. Resolving "voxtype" through PATH breaks inside the
+/// app bundle: the executable there is named voxtype-bin, and GUI-launched
+/// processes get a minimal PATH without the Homebrew symlink dir.
 fn get_voxtype_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("voxtype")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| PathBuf::from("voxtype"))
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("voxtype"))
 }
 
 /// Execute voxtype command
