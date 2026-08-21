@@ -63,6 +63,7 @@ mod menu_ids {
     // Engine selection
     pub const ENGINE_PARAKEET: &str = "engine_parakeet";
     pub const ENGINE_WHISPER: &str = "engine_whisper";
+    pub const ENGINE_SENSEVOICE: &str = "engine_sensevoice";
 
     // Hotkey mode
     pub const HOTKEY_PTT: &str = "hotkey_ptt";
@@ -133,8 +134,26 @@ fn is_autostart_enabled() -> bool {
     plist.exists()
 }
 
-/// Get list of downloaded models (both Whisper and Parakeet)
-fn get_downloaded_models() -> Vec<(String, bool)> {
+/// Which engine a downloaded model belongs to
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelEngine {
+    Whisper,
+    Parakeet,
+    SenseVoice,
+}
+
+impl ModelEngine {
+    fn label(&self) -> &'static str {
+        match self {
+            ModelEngine::Whisper => "Whisper",
+            ModelEngine::Parakeet => "Parakeet",
+            ModelEngine::SenseVoice => "SenseVoice",
+        }
+    }
+}
+
+/// Get list of downloaded models (Whisper, Parakeet, SenseVoice)
+fn get_downloaded_models() -> Vec<(String, ModelEngine)> {
     let mut models = Vec::new();
     let models_dir = Config::models_dir();
 
@@ -143,7 +162,7 @@ fn get_downloaded_models() -> Vec<(String, bool)> {
             let name = entry.file_name().to_string_lossy().to_string();
             let path = entry.path();
 
-            // Check for Whisper models (ggml-*.bin files)
+            // Whisper models (ggml-*.bin files)
             if name.starts_with("ggml-") && name.ends_with(".bin") {
                 // Extract model name from filename (e.g., "ggml-base.en.bin" -> "base.en")
                 let model_name = name
@@ -151,19 +170,28 @@ fn get_downloaded_models() -> Vec<(String, bool)> {
                     .and_then(|s| s.strip_suffix(".bin"))
                     .unwrap_or(&name)
                     .to_string();
-                models.push((model_name, false)); // false = Whisper
+                models.push((model_name, ModelEngine::Whisper));
             }
 
-            // Check for Parakeet models (directories with encoder-model.onnx)
-            if path.is_dir() && name.contains("parakeet") {
-                if path.join("encoder-model.onnx").exists() {
-                    models.push((name, true)); // true = Parakeet
-                }
+            // Parakeet models (directories with encoder-model.onnx)
+            if path.is_dir() && name.contains("parakeet") && path.join("encoder-model.onnx").exists()
+            {
+                models.push((name.clone(), ModelEngine::Parakeet));
+            }
+
+            // SenseVoice models (directories with model.int8.onnx or model.onnx + tokens.txt)
+            if cfg!(feature = "sensevoice")
+                && path.is_dir()
+                && name.starts_with("sensevoice")
+                && (path.join("model.int8.onnx").exists() || path.join("model.onnx").exists())
+                && path.join("tokens.txt").exists()
+            {
+                models.push((name.clone(), ModelEngine::SenseVoice));
             }
         }
     }
 
-    models.sort();
+    models.sort_by(|a, b| a.0.cmp(&b.0));
     models
 }
 
@@ -275,23 +303,65 @@ fn set_hotkey_mode(mode: ActivationMode) -> bool {
     std::fs::write(&config_path, new_content).is_ok()
 }
 
-/// Update config to use a specific model
-fn set_model(model_name: &str, is_parakeet: bool) -> bool {
-    if is_parakeet {
-        voxtype_cmd_wait(&["setup", "parakeet", "--set", model_name])
+/// Update the [sensevoice] model in the config file
+fn set_sensevoice_model(model_name: &str) -> bool {
+    let config_path = match Config::default_path() {
+        Some(p) => p,
+        None => return false,
+    };
+
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    let new_content = if content.contains("[sensevoice]") {
+        let re = regex::Regex::new(r#"(\[sensevoice\][^\[]*?)model\s*=\s*"[^"]*""#).unwrap();
+        if re.is_match(&content) {
+            re.replace(&content, format!(r#"${{1}}model = "{}""#, model_name))
+                .to_string()
+        } else {
+            content.replace(
+                "[sensevoice]",
+                &format!("[sensevoice]\nmodel = \"{}\"", model_name),
+            )
+        }
     } else {
-        voxtype_cmd_wait(&["setup", "model", "--set", model_name])
-    }
+        format!("{}\n[sensevoice]\nmodel = \"{}\"\n", content, model_name)
+    };
+
+    std::fs::write(&config_path, new_content).is_ok()
+}
+
+/// Update config to use a specific model (also switches to its engine)
+fn set_model(model_name: &str, engine: ModelEngine) -> bool {
+    let engine_ok = set_engine(match engine {
+        ModelEngine::Whisper => TranscriptionEngine::Whisper,
+        ModelEngine::Parakeet => TranscriptionEngine::Parakeet,
+        ModelEngine::SenseVoice => TranscriptionEngine::SenseVoice,
+    });
+    let model_ok = match engine {
+        ModelEngine::Whisper => voxtype_cmd_wait(&["setup", "model", "--set", model_name]),
+        ModelEngine::Parakeet => voxtype_cmd_wait(&["setup", "parakeet", "--set", model_name]),
+        ModelEngine::SenseVoice => set_sensevoice_model(model_name),
+    };
+    engine_ok && model_ok
 }
 
 /// Restart the daemon
 fn restart_daemon() {
-    // Try launchctl first
+    // Try launchctl first (no-op unless the LaunchAgent is installed)
+    let uid = unsafe { libc::getuid() };
     let _ = std::process::Command::new("launchctl")
-        .args(["kickstart", "-k", "gui/$(id -u)/io.voxtype.daemon"])
+        .args([
+            "kickstart",
+            "-k",
+            &format!("gui/{}/io.voxtype.daemon", uid),
+        ])
         .status();
 
-    // Fallback: kill and restart
+    // Fallback: kill and restart. Match both installed process names
+    // (app bundle runs voxtype-bin, CLI runs voxtype).
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "voxtype-bin daemon"])
+        .status();
     let _ = std::process::Command::new("pkill")
         .args(["-f", "voxtype daemon"])
         .status();
@@ -314,9 +384,67 @@ fn notify(title: &str, message: &str) {
         .spawn();
 }
 
+/// The configured model name for an engine, normalized for comparison
+/// against directory/file names in the models directory.
+fn configured_model_for(config: &Config, engine: ModelEngine) -> String {
+    match engine {
+        ModelEngine::Whisper => config.whisper.model.clone(),
+        ModelEngine::Parakeet => config
+            .parakeet
+            .as_ref()
+            .map(|p| p.model.clone())
+            .unwrap_or_default(),
+        ModelEngine::SenseVoice => {
+            let m = config
+                .sensevoice
+                .as_ref()
+                .map(|s| s.model.clone())
+                .unwrap_or_else(|| "sensevoice-small".to_string());
+            // Config accepts both "small" and "sensevoice-small"
+            if m.starts_with("sensevoice") {
+                m
+            } else {
+                format!("sensevoice-{}", m)
+            }
+        }
+    }
+}
+
+/// Whether a downloaded model is the one the active engine currently uses
+fn is_active_model(config: &Config, model_name: &str, engine: ModelEngine) -> bool {
+    let engine_active = match engine {
+        ModelEngine::Whisper => config.engine == TranscriptionEngine::Whisper,
+        ModelEngine::Parakeet => config.engine == TranscriptionEngine::Parakeet,
+        ModelEngine::SenseVoice => config.engine == TranscriptionEngine::SenseVoice,
+    };
+    engine_active && configured_model_for(config, engine) == model_name
+}
+
+/// Re-derive all engine/model checkmarks from the on-disk config
+fn refresh_checkmarks(
+    engine_items: &[(TranscriptionEngine, CheckMenuItem)],
+    model_items: &[(String, ModelEngine, CheckMenuItem)],
+) {
+    let config = crate::config::load_config(None).unwrap_or_default();
+    for (engine, item) in engine_items {
+        item.set_checked(config.engine == *engine);
+    }
+    for (name, engine, item) in model_items {
+        item.set_checked(is_active_model(&config, name, *engine));
+    }
+}
+
 /// Build the settings submenus
-/// Returns (menu, status_item) so status can be updated later
-fn build_menu(config: &Config) -> (Menu, MenuItem) {
+/// Returns (menu, status_item, engine_items, model_items) so status and
+/// checkmarks can be updated later
+fn build_menu(
+    config: &Config,
+) -> (
+    Menu,
+    MenuItem,
+    Vec<(TranscriptionEngine, CheckMenuItem)>,
+    Vec<(String, ModelEngine, CheckMenuItem)>,
+) {
     let menu = Menu::new();
 
     // Recording controls
@@ -329,7 +457,7 @@ fn build_menu(config: &Config) -> (Menu, MenuItem) {
 
     // Engine submenu
     let engine_menu = Submenu::new("Engine", true);
-    let is_parakeet = config.engine == TranscriptionEngine::Parakeet;
+    let mut engine_items: Vec<(TranscriptionEngine, CheckMenuItem)> = Vec::new();
 
     #[cfg(feature = "parakeet")]
     {
@@ -337,57 +465,59 @@ fn build_menu(config: &Config) -> (Menu, MenuItem) {
             menu_ids::ENGINE_PARAKEET,
             "🦜 Parakeet (Fast)",
             true,
-            is_parakeet,
+            config.engine == TranscriptionEngine::Parakeet,
             None,
         );
         engine_menu.append(&parakeet_item).unwrap();
+        engine_items.push((TranscriptionEngine::Parakeet, parakeet_item));
     }
 
     let whisper_item = CheckMenuItem::with_id(
         menu_ids::ENGINE_WHISPER,
         "🗣️ Whisper",
         true,
-        !is_parakeet,
+        config.engine == TranscriptionEngine::Whisper,
         None,
     );
     engine_menu.append(&whisper_item).unwrap();
+    engine_items.push((TranscriptionEngine::Whisper, whisper_item));
+
+    #[cfg(feature = "sensevoice")]
+    {
+        let sensevoice_item = CheckMenuItem::with_id(
+            menu_ids::ENGINE_SENSEVOICE,
+            "🎧 SenseVoice (zh/en/ja/ko/yue)",
+            true,
+            config.engine == TranscriptionEngine::SenseVoice,
+            None,
+        );
+        engine_menu.append(&sensevoice_item).unwrap();
+        engine_items.push((TranscriptionEngine::SenseVoice, sensevoice_item));
+    }
+
     menu.append(&engine_menu).unwrap();
 
-    // Model submenu
+    // Model submenu: every downloaded model across engines; selecting one
+    // switches both the model and its engine.
     let model_menu = Submenu::new("Model", true);
     let downloaded_models = get_downloaded_models();
-    let current_model = if is_parakeet {
-        config
-            .parakeet
-            .as_ref()
-            .map(|p| p.model.clone())
-            .unwrap_or_default()
-    } else {
-        config.whisper.model.clone()
-    };
+    let mut model_items: Vec<(String, ModelEngine, CheckMenuItem)> = Vec::new();
 
     if downloaded_models.is_empty() {
         let no_models = MenuItem::new("No models downloaded", false, None);
         model_menu.append(&no_models).unwrap();
     } else {
-        for (model_name, model_is_parakeet) in &downloaded_models {
-            // Show models for the current engine
-            if *model_is_parakeet == is_parakeet {
-                let is_current = model_name == &current_model;
-                let display_name = if *model_is_parakeet {
-                    format!("🦜 {}", model_name)
-                } else {
-                    model_name.clone()
-                };
-                let item = CheckMenuItem::with_id(
-                    format!("{}{}", menu_ids::MODEL_PREFIX, model_name),
-                    display_name,
-                    true,
-                    is_current,
-                    None,
-                );
-                model_menu.append(&item).unwrap();
-            }
+        for (model_name, model_engine) in &downloaded_models {
+            let is_current = is_active_model(config, model_name, *model_engine);
+            let item = CheckMenuItem::with_id(
+                format!("{}{}", menu_ids::MODEL_PREFIX, model_name),
+                format!("{} ({})", model_name, model_engine.label()),
+                true,
+                is_current,
+                None,
+            );
+            model_menu.append(&item).unwrap();
+            model_items.push((model_name.clone(), *model_engine, item));
         }
     }
 
@@ -482,7 +612,7 @@ fn build_menu(config: &Config) -> (Menu, MenuItem) {
     let quit_item = MenuItem::with_id(menu_ids::QUIT, "Quit Menu Bar", true, None);
     menu.append(&quit_item).unwrap();
 
-    (menu, status_item)
+    (menu, status_item, engine_items, model_items)
 }
 
 /// Run the menu bar application
@@ -516,8 +646,8 @@ pub fn run(state_file: PathBuf) -> ! {
     // Load config
     let config = crate::config::load_config(None).unwrap_or_default();
 
-    // Build menu (returns menu and status item for updates)
-    let (menu, status_item) = build_menu(&config);
+    // Build menu (returns menu, status item, and checkmark handles for updates)
+    let (menu, status_item, engine_items, model_items) = build_menu(&config);
 
     // Get initial state
     let initial_state = read_state_from_file(&state_file);
@@ -589,18 +719,26 @@ pub fn run(state_file: PathBuf) -> ! {
                 // Engine selection
                 menu_ids::ENGINE_PARAKEET => {
                     if set_engine(TranscriptionEngine::Parakeet) {
-                        notify(
-                            "Voxtype",
-                            "Switched to Parakeet engine. Restart daemon to apply.",
-                        );
+                        refresh_checkmarks(&engine_items, &model_items);
+                        notify("Voxtype", "Switching to Parakeet engine, restarting daemon...");
+                        restart_daemon();
                     }
                 }
                 menu_ids::ENGINE_WHISPER => {
                     if set_engine(TranscriptionEngine::Whisper) {
+                        refresh_checkmarks(&engine_items, &model_items);
+                        notify("Voxtype", "Switching to Whisper engine, restarting daemon...");
+                        restart_daemon();
+                    }
+                }
+                menu_ids::ENGINE_SENSEVOICE => {
+                    if set_engine(TranscriptionEngine::SenseVoice) {
+                        refresh_checkmarks(&engine_items, &model_items);
                         notify(
                             "Voxtype",
-                            "Switched to Whisper engine. Restart daemon to apply.",
+                            "Switching to SenseVoice engine, restarting daemon...",
                         );
+                        restart_daemon();
                     }
                 }
 
@@ -690,9 +828,23 @@ pub fn run(state_file: PathBuf) -> ! {
                 // Model selection (dynamic IDs)
                 _ if id.starts_with(menu_ids::MODEL_PREFIX) => {
                     let model_name = id.strip_prefix(menu_ids::MODEL_PREFIX).unwrap_or("");
-                    let is_parakeet = model_name.contains("parakeet");
-                    if set_model(model_name, is_parakeet) {
-                        notify("Voxtype", &format!("Switched to model: {}", model_name));
+                    let model_engine = model_items
+                        .iter()
+                        .find(|(name, _, _)| name == model_name)
+                        .map(|(_, engine, _)| *engine);
+                    if let Some(model_engine) = model_engine {
+                        if set_model(model_name, model_engine) {
+                            refresh_checkmarks(&engine_items, &model_items);
+                            notify(
+                                "Voxtype",
+                                &format!(
+                                    "Switching to {} ({}), restarting daemon...",
+                                    model_name,
+                                    model_engine.label()
+                                ),
+                            );
+                            restart_daemon();
+                        }
                     }
                 }
 
