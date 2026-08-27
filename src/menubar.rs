@@ -409,6 +409,21 @@ fn restart_daemon() {
         let _ = wait_daemon_gone(3_000);
     }
 
+    // Reap our zombie children. Menu-spawned daemons are children of this
+    // process and nothing wait()s them, so an exited daemon lingers as a
+    // zombie: invisible to pgrep -f (empty cmdline) but kill(pid, 0) still
+    // succeeds, which makes the new daemon's stale-lock check treat the
+    // dead owner as alive and refuse to start.
+    unsafe {
+        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
+    }
+
+    // The daemon process is confirmed gone, so any remaining lock file is
+    // stale by definition: a graceful daemon exit does not remove it, and
+    // the daemon's own staleness check is fooled by zombies (above) and by
+    // zombies held by other parents. Same cleanup the app-launch path does.
+    let _ = std::fs::remove_file(Config::runtime_dir().join("voxtype.lock"));
+
     // Spawn the new daemon with output appended to the standard log files;
     // a silently failing daemon start is otherwise undebuggable (the
     // menubar's own stdout goes nowhere under LaunchServices).
