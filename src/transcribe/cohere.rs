@@ -526,9 +526,9 @@ impl Transcriber for CohereTranscriber {
         let start = std::time::Instant::now();
         let text = self.transcribe_samples(samples)?;
         tracing::info!(
-            "Cohere transcription completed in {:.2}s: {:?}",
+            "Cohere transcription completed in {:.2}s ({} chars)",
             start.elapsed().as_secs_f32(),
-            text.chars().take(80).collect::<String>(),
+            text.chars().count(),
         );
         Ok(text)
     }

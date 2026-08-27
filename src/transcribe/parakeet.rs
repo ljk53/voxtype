@@ -155,14 +155,10 @@ impl Transcriber for ParakeetTranscriber {
         };
 
         tracing::info!(
-            "Parakeet {:?} transcription completed in {:.2}s: {:?}",
+            "Parakeet {:?} transcription completed in {:.2}s ({} chars)",
             self.model_type,
             start.elapsed().as_secs_f32(),
-            if text.chars().count() > 50 {
-                format!("{}...", text.chars().take(50).collect::<String>())
-            } else {
-                text.clone()
-            }
+            text.chars().count()
         );
 
         Ok(text)

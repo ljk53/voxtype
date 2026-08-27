@@ -259,13 +259,9 @@ impl Transcriber for SenseVoiceTranscriber {
         };
 
         tracing::info!(
-            "SenseVoice transcription completed in {:.2}s: {:?}",
+            "SenseVoice transcription completed in {:.2}s ({} chars)",
             start.elapsed().as_secs_f32(),
-            if result.chars().count() > 50 {
-                format!("{}...", result.chars().take(50).collect::<String>())
-            } else {
-                result.clone()
-            }
+            result.chars().count()
         );
 
         Ok(result)

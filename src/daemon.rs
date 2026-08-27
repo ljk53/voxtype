@@ -1948,7 +1948,7 @@ impl Daemon {
                     tracing::debug!("Transcription was empty");
                     self.reset_to_idle(state).await;
                 } else {
-                    tracing::info!("Transcribed: {:?}", text);
+                    tracing::info!("Transcribed {} chars", text.chars().count());
 
                     // Apply text processing (replacements, punctuation)
                     let processed_text = self.text_processor.process(&text);

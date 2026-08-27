@@ -258,13 +258,9 @@ impl Transcriber for WhisperTranscriber {
         let result = text.trim().to_string();
 
         tracing::info!(
-            "Transcription completed in {:.2}s: {:?}",
+            "Transcription completed in {:.2}s ({} chars)",
             start.elapsed().as_secs_f32(),
-            if result.chars().count() > 50 {
-                format!("{}...", result.chars().take(50).collect::<String>())
-            } else {
-                result.clone()
-            }
+            result.chars().count()
         );
 
         Ok(result)
