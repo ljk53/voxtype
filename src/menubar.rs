@@ -346,6 +346,45 @@ fn set_model(model_name: &str, engine: ModelEngine) -> bool {
     engine_ok && model_ok
 }
 
+/// Daemon process name patterns: the app bundle runs voxtype-bin, the CLI
+/// runs voxtype.
+const DAEMON_PATTERNS: [&str; 2] = ["voxtype-bin daemon", "voxtype daemon"];
+
+/// Whether a daemon process is still running
+fn daemon_running() -> bool {
+    DAEMON_PATTERNS.iter().any(|pat| {
+        std::process::Command::new("pgrep")
+            .args(["-f", pat])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Signal all daemon processes (TERM, or KILL when force is set)
+fn kill_daemon(force: bool) {
+    for pat in DAEMON_PATTERNS {
+        let mut cmd = std::process::Command::new("pkill");
+        if force {
+            cmd.arg("-9");
+        }
+        let _ = cmd.args(["-f", pat]).status();
+    }
+}
+
+/// Wait up to `ms` for the daemon process to disappear
+fn wait_daemon_gone(ms: u64) -> bool {
+    let mut waited = 0;
+    while daemon_running() {
+        if waited >= ms {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        waited += 100;
+    }
+    true
+}
+
 /// Restart the daemon
 fn restart_daemon() {
     // Try launchctl first (no-op unless the LaunchAgent is installed)
@@ -358,18 +397,42 @@ fn restart_daemon() {
         ])
         .status();
 
-    // Fallback: kill and restart. Match both installed process names
-    // (app bundle runs voxtype-bin, CLI runs voxtype).
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "voxtype-bin daemon"])
-        .status();
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "voxtype daemon"])
-        .status();
+    // Ask the daemon to stop, then wait for the PROCESS to actually exit:
+    // it holds the single-instance lock until then, and with a large model
+    // loaded the final teardown can hang long after the "Daemon stopped"
+    // log line (observed >15s for whisper large-v3-turbo). A fixed sleep
+    // loses that race and the freshly spawned daemon exits on the lock.
+    // Escalate to SIGKILL after a short grace period instead of waiting.
+    kill_daemon(false);
+    if !wait_daemon_gone(2_000) {
+        kill_daemon(true);
+        let _ = wait_daemon_gone(3_000);
+    }
 
-    std::thread::sleep(Duration::from_millis(500));
-
-    voxtype_cmd(&["daemon"]);
+    // Spawn the new daemon with output appended to the standard log files;
+    // a silently failing daemon start is otherwise undebuggable (the
+    // menubar's own stdout goes nowhere under LaunchServices).
+    let logs_dir = dirs::home_dir()
+        .map(|h| h.join("Library/Logs/voxtype"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/voxtype"));
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let mut cmd = std::process::Command::new(get_voxtype_path());
+    cmd.arg("daemon");
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs_dir.join("stdout.log"))
+    {
+        cmd.stdout(f);
+    }
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs_dir.join("stderr.log"))
+    {
+        cmd.stderr(f);
+    }
+    let _ = cmd.spawn();
 }
 
 /// Show notification
